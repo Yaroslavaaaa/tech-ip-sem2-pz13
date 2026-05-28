@@ -2,259 +2,169 @@
 ### Подключение к RabbitMQ. Отправка и получение сообщений. 27.05.2026
 
 
-### Конфигурация docker-compose для RabbitMQ
+### Как поднят RabbitMQ и какие очереди созданы
 
-Файл `deploy/rabbit/docker-compose.yml`:
+RabbitMQ поднят через Docker Compose. Используется образ `rabbitmq:3.13-management-alpine`, который включает встроенный веб-интерфейс для мониторинга.
 
-```yaml
-services:
-  rabbitmq:
-    image: rabbitmq:3.13-management-alpine
-    container_name: rabbitmq
-    ports:
-      - "5672:5672"   
-      - "15672:15672" 
-    environment:
-      - RABBITMQ_DEFAULT_USER=guest
-      - RABBITMQ_DEFAULT_PASS=guest
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-```
+Порты:
+- `5672` — AMQP (для подключения приложений)
+- `15672` — Management UI (для администрирования)
 
-### Используемые порты
+Созданные очереди:
+- `task_jobs` — основная очередь задач
+- `task_jobs_dlq` — (Dead Letter Queue
 
- -5672 - AMQP (основной протокол для приложений)
- -15672 - Management UI (веб-интерфейс для администрирования)
+Очереди создаются автоматически при запуске worker'а с помощью функции `DeclareDLQSetup`. Основная очередь настраивается с параметром `x-dead-letter-routing-key`, который указывает на DLQ. Это означает, что сообщения, которые не удалось обработать, автоматически отправляются в DLQ.
 
-### Запуск
+## Формат сообщения (JSON)
 
-```bash
-cd deploy/rabbit
-docker-compose up -d
-
-cd deploy/tls
-docker-compose up -d
-```
-
-
-## Формат сообщения
-
-### Структура события
-
-Сообщения публикуются в формате JSON. Структура события `TaskEvent`:
+Задача, отправляемая в очередь, имеет следующую структуру:
 
 ```json
 {
-    "event": "task.created",
-    "task_id": "t_abc12345",
-    "request_id": "pz13-001",
-    "ts": "2026-05-27T12:00:00Z",
-    "producer": "tasks-service",
-    "version": "1.0"
+    "job": "process_task",
+    "task_id": "t_fail",
+    "attempt": 1,
+    "message_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5"
 }
 ```
 
-### Описание полей
+Поля:
+- `job` — тип задачи (process_task)
+- `task_id` — идентификатор задачи в БД
+- `attempt` — номер текущей попытки обработки (начинается с 1)
+- `message_id` — уникальный UUID для идемпотентности
 
-| Поле | Тип | Описание |
-|------|-----|----------|
-| `event` | string | Тип события (`task.created`) |
-| `task_id` | string | Идентификатор созданной задачи |
-| `request_id` | string | ID запроса для трассировки |
-| `ts` | timestamp | Время создания события |
-| `producer` | string | Имя сервиса-отправителя |
-| `version` | string | Версия формата события |
+### Где и как публикуется сообщение
 
-### Почему выбран JSON
+Сообщение публикуется сервисом `tasks` при вызове эндпоинта `/v1/jobs/process-task`. 
 
-- Человеко-читаемый формат — легко отлаживать и анализировать
-- Простота парсинга — нативная поддержка в Go (`encoding/json`)
-- Расширяемость — можно добавлять новые поля без breaking changes
-- Стандарт — формат для обмена данными в микросервисах
+Порядок публикации:
+1. Клиент отправляет POST-запрос с `task_id`
+2. Сервис проверяет существование задачи в БД
+3. Если задача существует, формируется `TaskJob` с `attempt=1` и новым `message_id`
+4. Сообщение публикуется в очередь `task_jobs`
 
+### Как устроен worker и где делается ack
 
-## Producer: публикация сообщений из tasks
+Worker — отдельный сервис, который запускается в контейнере и подписывается на очередь `task_jobs`.
 
-### Где и когда публикуется сообщение
+Логика обработки одного сообщения:
 
-Сообщение публикуется после успешного создания задачи в базе данных, но до возврата ответа клиенту.
-
-```go
-func (s *TaskService) Create(ctx context.Context, token string, title, description, dueDate string) (models.Task, error) {
-	requestID, _ := ctx.Value(logger.RequestIDKey{}).(string)
-
-	log := s.logger.With(
-		zap.String("request_id", requestID),
-		zap.String("operation", "create"),
-	)
-
-	username, err := s.authClient.VerifyToken(ctx, token)
-	if err != nil {
-		return models.Task{}, fmt.Errorf("auth failed: %w", err)
-	}
-
-	task := models.Task{
-		ID:          "t_" + uuid.New().String()[:8],
-		Title:       title,
-		Description: description,
-		DueDate:     dueDate,
-		Done:        false,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
-	}
-
-	if err := s.repo.Create(ctx, task); err != nil {
-		return models.Task{}, err
-	}
-
-	log.Info("Task created",
-		zap.String("task_id", task.ID),
-		zap.String("username", username),
-	)
-  //ПУБЛИКАЦИЯ СООБЩЕНИЯ
-	if s.rabbitClient != nil {
-
-		queueName := os.Getenv("RABBIT_QUEUE_NAME")
-		if queueName == "" {
-			queueName = "task_events"
-		}
-
-		if err := s.rabbitClient.PublishTaskEvent(ctx, queueName, task.ID, requestID); err != nil {
-			log.Warn("Failed to publish task created event", zap.Error(err))
-		} else {
-			log.Debug("Task created event published", zap.String("task_id", task.ID))
-		}
-	}
-
-	return task, nil
-}
-```
+<img width="2374" height="5183" alt="2026-05-28" src="https://github.com/user-attachments/assets/efbbaf6a-9b92-4e6c-a3d6-137da6d83912" />
 
 
-## Consumer: Worker сервис
+Где используется ack:
+- После успешной обработки: `delivery.Ack(false)`
+- После retry (публикации нового сообщения): `delivery.Ack(false)`
+- После отправки в DLQ: `delivery.Ack(false)`
 
+Ack означает: сообщение обработано (или перенаправлено), можно удалить из основной очереди. Если worker упадёт до ack, сообщение будет доставлено снова.
 
-### Структура worker сервиса
-
-```
-.
-│   Dockerfile
-│   go.mod
-│   go.sum
-│   
-├───cmd
-│   └───worker
-│           main.go
-│           
-└───internal
-    ├───consumer
-    │       consumer.go
-    │       
-    └───rabbitmq
-            client.go
-            
-```
-
-### Архитектура worker
-
-Worker — отдельный сервис, который:
-1. Подключается к RabbitMQ
-2. Объявляет очередь `task_events` (те же параметры durable)
-3. Устанавливает prefetch для контроля нагрузки
-4. Подписывается на сообщения
-5. Обрабатывает каждое сообщение и отправляет `ack`
-
-
-
-### бработка сообщений и ack
-
-```go
-func handleMessage(msg amqp.Delivery) {
-    // 1. Парсим JSON
-    var event TaskEvent
-    if err := json.Unmarshal(msg.Body, &event); err != nil {
-        msg.Nack(false, true) // requeue при ошибке парсинга
-        return
-    }
-    
-    // 2. Обрабатываем событие (логируем)
-    log.Printf("[EVENT] %s for task %s", event.Event, event.TaskID)
-    
-    // 3. Подтверждаем успешную обработку
-    msg.Ack(false)
-}
-```
-
-
-
+### Демонстрация
 
 ### Создание задачи
-<img width="1382" height="652" alt="image" src="https://github.com/user-attachments/assets/1865dc6d-3595-42af-bb82-39784484be27" />
+<img width="1372" height="662" alt="image" src="https://github.com/user-attachments/assets/642ad505-2a96-47bb-bfb1-00e73f09ffba" />
+
+
+### Отправка задачи в очередь
+<img width="1384" height="655" alt="image" src="https://github.com/user-attachments/assets/45497a48-6e90-4746-ae93-b61160508efe" />
+
+
+### Отправка задачи в очередь(DLQ)
+<img width="1384" height="655" alt="image" src="https://github.com/user-attachments/assets/57042308-79c5-4904-b8a5-fb16c5ce7fe7" />
 
 
 
-### Логи worker
+### Логи worker'а
 
+Успешная обработка (обычная задача):
 ```
-[WORKER] 2026/05/27 19:25:47 Connecting to RabbitMQ at amqp://guest:guest@rabbitmq:5672/
-[WORKER] 2026/05/27 19:25:47 RabbitMQ connected successfully. Queue: task_events
-2026/05/27 19:25:47 Starting RabbitMQ consumer worker...
-[WORKER] 2026/05/27 19:25:47 Prefetch set to 1
-[WORKER] 2026/05/27 19:25:47 Started consuming from queue: task_events
-[WORKER] 2026/05/27 19:25:47 Worker started. Waiting for messages on queue: task_events
-[WORKER] 2026/05/27 19:26:32 Received message: {"event":"task.created","task_id":"t_0576b079","request_id":"017064a0-b89a-414a-a4cb-aada9e62e23f","ts":"2026-05-27T19:26:32.724421155Z","producer":"tasks-service","version":"1.0"}
-[WORKER] 2026/05/27 19:26:32 [EVENT] task.created for task t_0576b079
+2026-05-28T09:21:15.708Z        INFO    processor/processor.go:55       Processing job  {"component": "processor", "job_id": "4a6451e6-8149-4b8c-bbc0-46a7ecf81c61", "task_id": "t_4f6bbc99", "attempt": 1}
+2026-05-28T09:21:17.710Z        INFO    processor/processor.go:75       Job processed successfully      {"component": "processor", "job_id": "4a6451e6-8149-4b8c-bbc0-46a7ecf81c61", "task_id": "t_4f6bbc99"}
 ```
 
+Retry и DLQ (задача t_fail):
+```
+2026-05-28T09:21:59.209Z        INFO    processor/processor.go:55       Processing job  {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "task_id": "t_fail", "attempt": 1}
+2026-05-28T09:22:01.211Z        WARN    processor/processor.go:83       Job processing failed   {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "attempt": 1, "error": "simulated processing error for task t_fail"}
+worker-service/internal/processor.(*TaskProcessor).ProcessJob
+        /app/services/worker/internal/processor/processor.go:83
+main.main.func1
+        /app/services/worker/cmd/worker/main.go:111
+2026-05-28T09:22:01.212Z        DEBUG   rabbitmq/client.go:169  Job published   {"component": "rabbitmq", "queue": "task_jobs", "message_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5"}
+2026-05-28T09:22:01.212Z        INFO    processor/processor.go:98       Job retried     {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "new_attempt": 2}
+2026-05-28T09:22:01.213Z        INFO    processor/processor.go:55       Processing job  {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "task_id": "t_fail", "attempt": 2}
+2026-05-28T09:22:03.214Z        WARN    processor/processor.go:83       Job processing failed   {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "attempt": 2, "error": "simulated processing error for task t_fail"}
+worker-service/internal/processor.(*TaskProcessor).ProcessJob
+        /app/services/worker/internal/processor/processor.go:83
+main.main.func1
+        /app/services/worker/cmd/worker/main.go:111
+2026-05-28T09:22:03.214Z        DEBUG   rabbitmq/client.go:169  Job published   {"component": "rabbitmq", "queue": "task_jobs", "message_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5"}
+2026-05-28T09:22:03.215Z        INFO    processor/processor.go:98       Job retried     {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "new_attempt": 3}
+2026-05-28T09:22:03.221Z        INFO    processor/processor.go:55       Processing job  {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "task_id": "t_fail", "attempt": 3}
+2026-05-28T09:22:05.223Z        WARN    processor/processor.go:83       Job processing failed   {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "attempt": 3, "error": "simulated processing error for task t_fail"}
+worker-service/internal/processor.(*TaskProcessor).ProcessJob
+        /app/services/worker/internal/processor/processor.go:83
+main.main.func1
+        /app/services/worker/cmd/worker/main.go:111
+2026-05-28T09:22:05.223Z        WARN    processor/processor.go:107      Max attempts reached, sending to DLQ    {"component": "processor", "job_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5", "attempts": 3}
+worker-service/internal/processor.(*TaskProcessor).ProcessJob
+        /app/services/worker/internal/processor/processor.go:107
+main.main.func1
+        /app/services/worker/cmd/worker/main.go:111
+2026-05-28T09:22:05.223Z        WARN    rabbitmq/client.go:203  Publishing to DLQ       {"component": "rabbitmq", "dlq": "task_jobs_dlq", "reason": "max_attempts_exceeded", "message_id": "fa9b9378-3c20-4ec2-ba04-7a6610e13ad5"}
+tech-ip-sem2/shared/rabbitmq.(*Client).PublishToDLQ
+        /app/shared/rabbitmq/client.go:203
+worker-service/internal/processor.(*TaskProcessor).ProcessJob
+        /app/services/worker/internal/processor/processor.go:111
+main.main.func1
+        /app/services/worker/cmd/worker/main.go:111
+2026-05-28T09:22:05.223Z        INFO    rabbitmq/client.go:229  Message sent to DLQ     {"component": "rabbitmq", "dlq": "task_jobs_dlq"}
+```
 
-### Проверка в RabbitMQ Management UI
-<img width="1712" height="817" alt="image" src="https://github.com/user-attachments/assets/16dc25a3-4757-4b32-a7a8-c10e54998ef1" />
+После трёх неудачных попыток сообщение попадает в очередь `task_jobs_dlq`.
 
-<img width="1277" height="292" alt="image" src="https://github.com/user-attachments/assets/d0e4dfa2-4d98-4d9e-978c-75d616908317" />
+### Демонстрация идемпотентности
+
+В worker'е реализовано хранилище обработанных `message_id` (в памяти). При получении сообщения сначала проверяется, не обрабатывалось ли оно ранее. Это защищает от дублей при повторных доставках.
+
+```go
+if p.processedStore.IsProcessed(job.MessageID) {
+    p.logger.Warn("Duplicate message detected, skipping")
+    delivery.Ack(false)
+    return
+}
+```
+
+### Итог
+
+В результате практического занятия реализована полностью рабочая очередь задач:
+
+1. Созданы основная очередь task_jobs и очередь task_jobs_dlq с настройкой Dead Letter
+2. Эндпоинт /v1/jobs/process-task публикует задачи в JSON-формате
+3. Consumer (worker) читает очередь, обрабатывает задачи и отправляет ack
+4. При ошибке выполняется до 3 попыток с увеличением счётчика
+5. После 3 неудачных попыток сообщение отправляется в task_jobs_dlq
+6. Хранилище message_id предотвращает повторную обработку
 
 
 ### Контрольные вопросы
 
-1. Зачем нужен брокер сообщений, если есть HTTP?
-HTTP — синхронный протокол, требующий немедленного ответа. Брокер сообщений позволяет:
-- Асинхронную обработку (клиент не ждёт завершения фоновых задач)
-- Слабую связанность компонентов (отправитель не знает о получателе)
-- Буферизацию при временной недоступности получателя
-- Гарантированную доставку
+1. Чем "job queue" отличается от "event queue"?
+Job queue предназначена для выполнения конкретной работы, требует подтверждения и может пересылаться при ошибке. Event queue — это уведомление о том, что что-то произошло, обработка обычно лёгкая и не требует retry.
 
-2. Что такое ack и зачем он нужен?
-Ack (acknowledgement) — подтверждение от consumer'а, что сообщение успешно обработано. Без ack брокер не может быть уверен, что сообщение не потерялось. Ack гарантирует, что сообщение не будет потеряно при падении consumer'а.
+2. Почему система очередей часто работает как at-least-once?
+Потому что ack может не успеть до падения consumer'а. Брокер не знает, обработалось сообщение или нет, и доставляет его снова. Гарантировать exactly-once сложнее и дороже.
 
-3. Почему возможна повторная доставка сообщения?
+3. Как DLQ помогает эксплуатации?
+DLQ изолирует "плохие" сообщения, которые не получилось обработать. Они не блокируют основную очередь, их можно анализировать, исправлять ошибки и перезапускать вручную.
 
-Сообщение может быть доставлено повторно, если:
-- Consumer не отправил ack в течение таймаута
-- Consumer упал после получения, но до отправки ack
-- Был отправлен nack с requeue=true
-- Сеть между брокером и consumer'ом нестабильна
+4. Почему ретраи нельзя делать бесконечно?
+Бесконечные ретраи могут забить очередь, создавать бесконечную нагрузку на систему, маскировать реальные проблемы и откладывать ошибку, не давая понять, что что-то сломалось навсегда.
 
-4. Что делает prefetch?
-
-Prefetch ограничивает количество сообщений, которые consumer может получить до отправки ack. Это:
-- Предотвращает перегрузку consumer'а
-- Обеспечивает справедливое распределение сообщений между несколькими consumer'ами
-- Позволяет контролировать потребление ресурсов
-
-5. Чем очередь durable отличается от non-durable?
-Durable очередь сохраняется после перезапуска RabbitMQ (метаданные очереди сохраняются на диск). Non-durable очередь удаляется при рестарте брокера. Сообщения в durable очереди также могут быть persistent (сохраняться на диск) или transient (храниться только в памяти).
+5. Что такое идемпотентность и как её реализовать минимально?
+Идемпотентность — свойство операции, при котором повторное выполнение не меняет результат. Минимальная реализация: присвоить каждому сообщению уникальный `message_id` и хранить список уже обработанных ID, например в `map[string]bool`.
 
 
-### Вывод
-
-В результате практического занятия успешно реализована асинхронная коммуникация между сервисами через RabbitMQ:
-
-1. RabbitMQ поднят в Docker с доступом через порты 5672 и 15672
-2. События публикуются в формате JSON с полями event, task_id, request_id, ts, producer, version
-3. Публикация происходит после создания задачи в БД (best effort)
-4. Worker потребляет сообщения с ручным ack и prefetch=1
 
